@@ -103,6 +103,8 @@ class CustomExecutor(Executor):
 
             loop_task = loop.create_task(readLoop())
 
+            create_worker: CreateWorkerType = None
+
             try:
                 available_devices: int = await peer.getParam("available_devices")
                 create_worker = await peer.getParam("create_worker")
