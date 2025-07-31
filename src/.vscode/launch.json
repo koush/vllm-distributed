@@ -36,6 +36,20 @@
             "env": {
                 "VLLM_HOST_IP": "192.168.2.142",
             }
-        }
+        },
+
+        {
+            "name": "Client",
+            "type": "debugpy",
+            "subProcess": false,
+            "justMyCode": false,
+            "request": "launch",
+            "program": "${workspaceFolder}/launch.py",
+            "console": "integratedTerminal",
+            "args": [
+                "worker",
+                "192.168.2.142"
+            ]
+        },
     ]
 }
