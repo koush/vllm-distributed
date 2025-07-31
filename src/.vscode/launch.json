@@ -7,7 +7,7 @@
         {
             "name": "Python Debugger",
             "type": "debugpy",
-            // "subProcess": false,
+            "subProcess": false,
             "justMyCode": false,
             "request": "launch",
             "program": "${workspaceFolder}/launch.py",
@@ -42,7 +42,7 @@
         {
             "name": "Client",
             "type": "debugpy",
-            // "subProcess": false,
+            "subProcess": false,
             "justMyCode": false,
             "request": "launch",
             "program": "${workspaceFolder}/launch.py",
