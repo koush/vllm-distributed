@@ -57,7 +57,7 @@ VLLM_SERVER_PORT = int(os.environ.get("VLLM_SERVER_PORT", 30044))
 logger = init_logger("vllm.entrypoints.openai.api_server")
 
 RunWorkerType = Callable[[Union[str, bytes], Optional[int], Any, Any], Awaitable[Any]]
-
+CreateWorkerType = Callable[[VllmConfig, int], Awaitable[RunWorkerType]]
 
 class CustomExecutor(Executor):
     uses_ray: bool = False
@@ -84,7 +84,7 @@ class CustomExecutor(Executor):
 
         distributed_init_method = get_distributed_init_method(get_ip(), get_open_port())
 
-        remote_nodes = asyncio.queues.Queue[list[RunWorkerType]]()
+        remote_nodes = asyncio.queues.Queue[list[CreateWorkerType]]()
         pending_remote_nodes: dict[str, list[RunWorkerType]] = {}
 
         async def handle_client(
@@ -104,10 +104,11 @@ class CustomExecutor(Executor):
             loop_task = loop.create_task(readLoop())
 
             try:
-                run_worker = await peer.getParam("run_worker")
-                remote_node.append(run_worker)
-                # whenever an ip has enough workers, put the list in the ready queue.
-                if len(remote_node) == self.parallel_config.tensor_parallel_size:
+                available_devices: int = await peer.getParam("available_devices")
+                create_worker = await peer.getParam("create_worker")
+                remote_node.append(create_worker)
+                # after the remote node has all available devices
+                if len(remote_node) == available_devices:
                     remote_nodes.put_nowait(remote_node)
                 await loop_task
             except:
@@ -116,7 +117,7 @@ class CustomExecutor(Executor):
             finally:
                 print(f"Closing connection {addr}")
                 # remove from remote_worker list
-                remote_node.remove(run_worker)
+                remote_node.remove(create_worker)
                 writer.close()
                 await writer.wait_closed()
 
@@ -127,7 +128,7 @@ class CustomExecutor(Executor):
             loop = asyncio.get_event_loop()
             loop_ready.set_result(loop)
 
-            async def get_run_worker(local_rank: int, pipeline_rank: int):
+            async def get_run_worker(local_rank: int, pipeline_rank: int) -> RunWorkerType:
                 rank = local_rank + pipeline_rank * tensor_parallel_size
                 parent_conn, child_conn = multiprocessing.Pipe()
                 process_kwargs = {
@@ -169,40 +170,40 @@ class CustomExecutor(Executor):
             if current_platform.is_cuda():
                 available_devices = cuda_device_count_stateless()
 
-            wrapper_futures: list[asyncio.Future[WorkerWrapperBase]] = []
+            run_worker_futures: list[asyncio.Future[RunWorkerType]] = []
             for pipeline_rank in range(self.parallel_config.pipeline_parallel_size):
                 # try to fulfill as many workers as possible locally
-                if available_devices >= self.parallel_config.tensor_parallel_size:
-                    for local_rank in range(self.parallel_config.tensor_parallel_size):
-                        wrapper_futures.append(
+                if available_devices >= tensor_parallel_size:
+                    for local_rank in range(tensor_parallel_size):
+                        run_worker_futures.append(
                             asyncio.create_task(
                                 get_run_worker(local_rank, pipeline_rank)
                             )
                         )
-                    available_devices -= self.parallel_config.tensor_parallel_size
+                    available_devices -= tensor_parallel_size
                 else:
-                    remote_workers = await remote_nodes.get()
+                    create_workers = await remote_nodes.get()
                     # node is not usable
-                    if len(remote_workers) < self.parallel_config.tensor_parallel_size:
+                    if len(create_workers) < tensor_parallel_size:
                         print(
-                            f"WARNING: Not enough workers on remote node {remote_workers}, skipping... this may be a bug."
+                            f"WARNING: Not enough workers on remote node {create_workers}, skipping... this may be a bug."
                         )
                         continue
 
-                    for local_rank in range(self.parallel_config.tensor_parallel_size):
-                        worker = remote_workers.pop()
-                        fut = asyncio.Future[RunWorkerType]()
-                        fut.set_result(worker)
-                        wrapper_futures.append(fut)
+                    for local_rank in range(tensor_parallel_size):
+                        rank = local_rank + pipeline_rank * tensor_parallel_size
+                        create_worker = create_workers.pop()
+                        run_worker_futures.append(loop.create_task(create_worker(self.vllm_config, rank)))
 
                     # the node may still be usable, if so readd it
-                    if len(remote_workers) >= self.parallel_config.tensor_parallel_size:
-                        remote_nodes.put_nowait(remote_workers)
+                    # note: does this work? possibly different number of workers per node?
+                    if len(create_workers) >= tensor_parallel_size:
+                        remote_nodes.put_nowait(create_workers)
 
-                need_devices -= self.parallel_config.tensor_parallel_size
+                need_devices -= tensor_parallel_size
 
-            run_workers: list[Any] = []
-            for future in wrapper_futures:
+            run_workers: list[RunWorkerType] = []
+            for future in run_worker_futures:
                 run_workers.append(await future)
             return run_workers
 
@@ -475,6 +476,7 @@ def set_peer_run_worker(peer: rpc.RpcPeer, wrapper: WorkerWrapperBase, rank: int
         return results
 
     peer.params["run_worker"] = run_worker
+    return run_worker
 
 
 async def remote_worker_async_main(server_ip: str, available_devices: int):
@@ -496,8 +498,8 @@ async def remote_worker_async_main(server_ip: str, available_devices: int):
                 if wrapper:
                     raise Exception("Worker already created.")
                 wrapper = WorkerWrapperBase(vllm_config=vllm_config, rpc_rank=rank)
-                set_peer_run_worker(peer, wrapper, rank)
-                return wrapper
+                run_worker = set_peer_run_worker(peer, wrapper, rank)
+                return run_worker
 
             peer.params["create_worker"] = create_worker
 
