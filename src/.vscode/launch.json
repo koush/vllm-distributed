@@ -15,12 +15,12 @@
             "args": [
                 "serve",
                 "koushd/Qwen3-235B-A22B-Instruct-2507-AWQ",
-                "--seed",
-                "0",
                 "--api-key",
                 "token-abc123",
-                "-tp", "2",
-                "-pp", "1",
+                "-tp",
+                "2",
+                "-pp",
+                "1",
                 "--max-model-len",
                 "262144",
                 "--served-model-name",
@@ -35,9 +35,10 @@
             ],
             "env": {
                 "VLLM_HOST_IP": "192.168.2.142",
+                "NCCL_SOCKET_IFNAME": "eth0",
+                "GLOO_SOCKET_IFNAME": "eth0",
             }
         },
-
         {
             "name": "Client",
             "type": "debugpy",
@@ -47,9 +48,14 @@
             "program": "${workspaceFolder}/launch.py",
             "console": "integratedTerminal",
             "args": [
-                "worker",
+                "remote",
                 "192.168.2.142"
-            ]
+            ],
+            "env": {
+                "VLLM_HOST_IP": "192.168.2.105",
+                "NCCL_SOCKET_IFNAME": "eth0",
+                "GLOO_SOCKET_IFNAME": "eth0",
+            }
         },
     ]
 }
