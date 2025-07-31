@@ -1,48 +1,43 @@
-import gc
-from argparse import Namespace
-import importlib
-import os
-from typing import Any, AsyncIterator, Optional, Union, List
-import uvloop
 import asyncio
-import rpc_reader
-import rpc
-import socket
-import threading
 import concurrent.futures
+import gc
+import importlib
 import multiprocessing
 import multiprocessing.connection
+import os
+import socket
+import sys
+import threading
+import weakref
+from argparse import Namespace
 from asyncio.events import AbstractEventLoop
 from collections.abc import Awaitable, Callable
-import weakref
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, List, Optional, Union
 
+import uvloop
 import vllm.envs as envs
-from vllm.entrypoints.launcher import serve_http
-from vllm.utils import (get_distributed_init_method, get_ip,
-                        get_open_port)
 from vllm.config import VllmConfig
-
+from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.launcher import serve_http
+from vllm.entrypoints.openai.api_server import (
+    build_app, build_async_engine_client_from_engine_args, init_app_state,
+    load_log_config, maybe_register_tokenizer_info_endpoint, setup_server)
 # yapf conflicts with isort for this block
 # yapf: disable
 # yapf: enable
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
-from vllm.entrypoints.openai.api_server import (
-    setup_server,
-    load_log_config,
-    build_async_engine_client_from_engine_args,
-    maybe_register_tokenizer_info_endpoint,
-    build_app,
-    init_app_state,
-)
-from vllm.utils import run_method
-from vllm.v1.executor.abstract import Executor, FailureCallback
-from contextlib import asynccontextmanager
-from vllm.engine.protocol import EngineClient
-from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.logger import init_logger
-from vllm.worker.worker_base import WorkerWrapperBase
-from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+from vllm.utils import (get_distributed_init_method, get_ip, get_open_port,
+                        run_method)
+from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.worker.worker_base import WorkerWrapperBase
+
+import rpc
+import rpc_reader
 
 logger = init_logger("vllm.entrypoints.openai.api_server")
 
@@ -386,35 +381,13 @@ def vllm_main():
             cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
             cmds[cmd.name] = cmd
 
-    os.environ["VLLM_HOST_IP"] = "192.168.2.142"
+    args = parser.parse_args()
 
-    synthetic_args = [
-        "serve",
-        "koushd/Qwen3-235B-A22B-Instruct-2507-AWQ",
-        "--seed",
-        "0",
-        "--api-key",
-        "token-abc123",
-        "-tp",
-        os.environ.get("TP_SIZE", "2"),
-        "-pp",
-        os.environ.get("PP_SIZE", "1"),
-        "--distributed-executor-backend",
-        "external_launcher",
-        "--max-model-len",
-        "262144",
-        "--served-model-name",
-        "qwen3",
-        "--enable-auto-tool-choice",
-        "--tool-call-parser",
-        "hermes",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8000",
-    ]
+    # force external launcher and dummy up ranks that are checked by vllm
+    args.distributed_executor_backend = "external_launcher"
+    os.environ["RANK"] = "-1"
+    os.environ["LOCAL_RANK"] = "-1"
 
-    args = parser.parse_args(synthetic_args)
     if hasattr(args, "model_tag") and args.model_tag is not None:
         args.model = args.model_tag
 
@@ -426,11 +399,15 @@ def vllm_main():
     else:
         parser.print_help()
 
+def vllm_worker_main(server_ip: str, server_port: int):
+    pass
 
 if __name__ == "__main__":
-    # these need to be set for external_launcher to start
-    os.environ["RANK"] = "-1"
-    os.environ["LOCAL_RANK"] = "-1"
+    # if first arg is worker, launch the worker with the ip
+    if sys.argv[1] == "worker":
+        server_ip = sys.argv[2]
+        server_port = int(sys.argv[3])
+        vllm_worker_main(server_ip, server_port)
     vllm_main()
 
 async def worker_async_main(
