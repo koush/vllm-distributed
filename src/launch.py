@@ -14,6 +14,7 @@ from asyncio.events import AbstractEventLoop
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, List, Optional, Union
+import traceback
 
 import uvloop
 import vllm.envs as envs
@@ -31,10 +32,11 @@ from vllm.entrypoints.openai.api_server import (
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.logger import init_logger
 from vllm.utils import (get_distributed_init_method, get_ip, get_open_port,
-                        run_method)
+                        run_method, cuda_device_count_stateless)
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.worker.worker_base import WorkerWrapperBase
+from vllm.platforms import current_platform
 
 import rpc_reader
 
@@ -69,27 +71,48 @@ class CustomExecutor(Executor):
         distributed_init_method = get_distributed_init_method(
             get_ip(), get_open_port())
 
+        remote_nodes = asyncio.queues.Queue[list[RunWorkerType]]()
+        pending_remote_nodes: dict[str, list[RunWorkerType]] = {}
+
         async def handle_client(
             reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         ):
             addr = writer.get_extra_info("peername")
             print(f"Connection from {addr}")
+
+            remote_ip, remote_port = addr
+            remote_node = pending_remote_nodes.get(remote_ip, [])
+            pending_remote_nodes[remote_ip] = remote_node
+
+            rpc_transport = rpc_reader.RpcStreamTransport(reader, writer)
+            loop = asyncio.get_event_loop()
+            peer, readLoop = await rpc_reader.prepare_peer_readloop(
+                loop, rpc_transport
+            )
+
+            loop_task = loop.create_task(readLoop())
+
             try:
-                while data := await reader.read(1024):
-                    print(f"Received: {data!r}")
-                    writer.write(data)  # echo back
-                    await writer.drain()
-            except asyncio.CancelledError:
-                pass
+                run_worker = await peer.getParam("run_worker")
+                remote_node.append(run_worker)
+                # whenever an ip has enough workers, put the list in the ready queue.
+                if len(remote_node) == self.parallel_config.tensor_parallel_size:
+                    remote_nodes.put_nowait(remote_node)
+                await loop_task
+            except:
+                print(f"Error handling client {addr}")
+                traceback.print_exc()
             finally:
                 print(f"Closing connection {addr}")
+                # remove from remote_worker list
+                remote_node.remove(run_worker)
                 writer.close()
                 await writer.wait_closed()
 
         loop_ready = concurrent.futures.Future[AbstractEventLoop]()
         workers_ready = concurrent.futures.Future[tuple[int, list[RunWorkerType]]]()
 
-        async def worker_spawns():
+        async def spawn_and_listen_for_workers():
             loop = asyncio.get_event_loop()
             loop_ready.set_result(loop)
 
@@ -132,10 +155,37 @@ class CustomExecutor(Executor):
                 asyncio.run_coroutine_threadsafe(workerReadLoop(), loop=loop)
                 return await forkPeer.getParam("run_worker")
 
+
+            need_devices = self.world_size
+            available_devices = 1
+            if current_platform.is_cuda():
+                available_devices = cuda_device_count_stateless()
+
             wrapper_futures: list[asyncio.Future[WorkerWrapperBase]] = []
             for pipeline_rank in range(self.parallel_config.pipeline_parallel_size):
-                for local_rank in range(self.parallel_config.tensor_parallel_size):
-                    wrapper_futures.append(asyncio.create_task(get_run_worker(local_rank, pipeline_rank)))
+                # try to fulfill as many workers as possible locally
+                if available_devices >= self.parallel_config.tensor_parallel_size:
+                    for local_rank in range(self.parallel_config.tensor_parallel_size):
+                        wrapper_futures.append(asyncio.create_task(get_run_worker(local_rank, pipeline_rank)))
+                    available_devices -= self.parallel_config.tensor_parallel_size
+                else:
+                    remote_workers = await remote_nodes.get()
+                    # node is not usable
+                    if len(remote_workers) < self.parallel_config.tensor_parallel_size:
+                        print(f"WARNING: Not enough workers on remote node {remote_workers}, skipping... this may be a bug.")
+                        continue
+
+                    for local_rank in range(self.parallel_config.tensor_parallel_size):
+                        worker = remote_workers.pop()
+                        fut = asyncio.Future[RunWorkerType]()
+                        fut.set_result(worker)
+                        wrapper_futures.append(fut)
+
+                    # the node may still be usable, if so readd it
+                    if len(remote_workers) >= self.parallel_config.tensor_parallel_size:
+                        remote_nodes.put_nowait(remote_workers)
+
+                need_devices -= self.parallel_config.tensor_parallel_size
 
             run_workers: list[Any] = []
             for future in wrapper_futures:
@@ -151,7 +201,7 @@ class CustomExecutor(Executor):
 
             server = await asyncio.start_server(handle_client, sock=sock)
             print(f"Server listening on 0.0.0.0:{VLLM_SERVER_PORT}")
-            run_workers = await worker_spawns()
+            run_workers = await spawn_and_listen_for_workers()
             workers_ready.set_result((VLLM_SERVER_PORT, run_workers))
 
             async with server:
