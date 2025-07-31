@@ -1,0 +1,59 @@
+services:
+  vllm-distributed:
+    # image: nvcr.io/nvidia/tritonserver:25.06-vllm-python-py3
+    image: vllm-fixed
+    container_name: vllm-distributed
+    build:
+      context: .
+      dockerfile: Dockerfile.vllm
+    restart: unless-stopped
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ${ROOT_CACHE_PATH}:/root/.cache
+      - ./src:/distributed
+    environment:
+      - HUGGING_FACE_HUB_TOKEN
+      - VLLM_HOST_IP=${VLLM_HOST_IP:-127.0.0.1}
+      - VLLM_SLEEP_WHEN_IDLE=${VLLM_SLEEP_WHEN_IDLE:-1}
+      - VLLM_USE_MODELSCOPE
+      - NCCL_SOCKET_IFNAME
+      - GLOO_SOCKET_IFNAME
+      - TP_SIZE=${TP_SIZE:-1}
+      - PP_SIZE=${PP_SIZE:-1}
+    network_mode: host
+    ipc: host
+    entrypoint: []
+    command: /usr/sbin/sshd -D -p 2222
+    # command:
+    #   - python3
+    #   - /distributed/launch.py
+    #   - serve
+    #   - tclf90/Qwen3-235B-A22B-Instruct-2507-AWQ
+    #   - --seed
+    #   - "0"
+    #   - --api-key
+    #   - token-abc123
+    #   - -tp
+    #   - ${TP_SIZE:-1}
+    #   - -pp
+    #   - ${PP_SIZE:-1}
+    #   - --distributed-executor-backend
+    #   - external_launcher
+    #   - --max-model-len
+    #   - "262144"
+    #   - --served-model-name
+    #   - qwen3
+    #   - --enable-auto-tool-choice
+    #   - --tool-call-parser
+    #   - hermes
+    #   - --host
+    #   - 0.0.0.0
+    #   - --port
+    #   - "8000"
