@@ -145,11 +145,12 @@ class RpcStreamTransport(RpcTransport):
 
 class RpcPickleStreamTransport(RpcTransport):
     def __init__(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, pickler = pickle
     ) -> None:
         super().__init__()
         self.reader = reader
         self.writer = writer
+        self.pickler = pickler
 
     async def read(self):
         lengthBytes = await self.reader.readexactly(4)
@@ -159,7 +160,7 @@ class RpcPickleStreamTransport(RpcTransport):
         data = await self.reader.readexactly(length - 1)
         if type == 1:
             return data
-        message = pickle.loads(data)
+        message = self.pickler.loads(data)
         return message
 
     def writeMessage(self, type: int, buffer, reject):
@@ -173,7 +174,7 @@ class RpcPickleStreamTransport(RpcTransport):
                 reject(e)
 
     def writeSerialized(self, j, reject):
-        pickled = pickle.dumps(j)
+        pickled = self.pickler.dumps(j)
         return self.writeMessage(0, pickled, reject)
 
     def writeBuffer(self, buffer, reject):

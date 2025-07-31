@@ -15,6 +15,7 @@ from asyncio.events import AbstractEventLoop
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, List, Optional, Union
+import cloudpickle
 
 import uvloop
 import vllm.entrypoints.cli.benchmark.main
@@ -106,7 +107,7 @@ class CustomExecutor(Executor):
             remote_node = pending_remote_nodes.get(remote_ip, [])
             pending_remote_nodes[remote_ip] = remote_node
 
-            rpc_transport = rpc_reader.RpcPickleStreamTransport(reader, writer)
+            rpc_transport = rpc_reader.RpcPickleStreamTransport(reader, writer, pickler=cloudpickle)
             loop = asyncio.get_event_loop()
             peer, readLoop = await rpc_reader.prepare_peer_readloop(loop, rpc_transport)
 
@@ -515,7 +516,7 @@ async def remote_worker_async_main(server_ip: str, available_devices: int):
             # Attempt to connect to the server
             reader, writer = await asyncio.open_connection(server_ip, VLLM_SERVER_PORT)
 
-            rpc_transport = rpc_reader.RpcPickleStreamTransport(reader, writer)
+            rpc_transport = rpc_reader.RpcPickleStreamTransport(reader, writer, pickler=cloudpickle)
             peer, readLoop = await rpc_reader.prepare_peer_readloop(loop, rpc_transport)
 
             peer.params["print"] = print
