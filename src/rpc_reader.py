@@ -159,7 +159,7 @@ class RpcPickleStreamTransport(RpcTransport):
         data = await self.reader.readexactly(length - 1)
         if type == 1:
             return data
-        message = json.loads(data)
+        message = pickle.loads(data)
         return message
 
     def writeMessage(self, type: int, buffer, reject):
