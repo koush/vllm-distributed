@@ -36,8 +36,9 @@ from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.worker.worker_base import WorkerWrapperBase
 
-import rpc
 import rpc_reader
+
+VLLM_SERVER_PORT = int(os.environ["VLLM_SERVER_PORT"])
 
 logger = init_logger("vllm.entrypoints.openai.api_server")
 
@@ -144,15 +145,14 @@ class CustomExecutor(Executor):
         async def worker_loop():
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            port = 30044
-            sock.bind(("0.0.0.0", port))
+            sock.bind(("0.0.0.0", VLLM_SERVER_PORT))
             sock.listen()
             sock.setblocking(False)
 
             server = await asyncio.start_server(handle_client, sock=sock)
-            print(f"Server listening on 0.0.0.0:{port}")
+            print(f"Server listening on 0.0.0.0:{VLLM_SERVER_PORT}")
             run_workers = await worker_spawns()
-            workers_ready.set_result((port, run_workers))
+            workers_ready.set_result((VLLM_SERVER_PORT, run_workers))
 
             async with server:
                 await server.serve_forever()
