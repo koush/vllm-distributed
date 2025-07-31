@@ -38,7 +38,7 @@ from vllm.worker.worker_base import WorkerWrapperBase
 
 import rpc_reader
 
-VLLM_SERVER_PORT = int(os.environ["VLLM_SERVER_PORT"])
+VLLM_SERVER_PORT = int(os.environ.get("VLLM_SERVER_PORT", 30044))
 
 logger = init_logger("vllm.entrypoints.openai.api_server")
 
@@ -399,7 +399,7 @@ def vllm_main():
     else:
         parser.print_help()
 
-def vllm_worker_main(server_ip: str, server_port: int):
+def vllm_worker_main(server_ip: str):
     pass
 
 if __name__ == "__main__":
