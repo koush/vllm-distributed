@@ -55,7 +55,7 @@ VLLM_SERVER_PORT = int(os.environ.get("VLLM_SERVER_PORT", 30044))
 logger = init_logger("vllm.entrypoints.openai.api_server")
 
 RunWorkerType = Callable[[Union[str, bytes], Optional[int], Any, Any], Awaitable[Any]]
-CreateWorkerType = Callable[[VllmConfig, int], Awaitable[RunWorkerType]]
+CreateWorkerType = Callable[[VllmConfig, int, dict[str, str]], Awaitable[RunWorkerType]]
 
 
 class CustomExecutor(Executor):
@@ -196,8 +196,6 @@ class CustomExecutor(Executor):
                 if name in os.environ:
                     worker_environ[name] = os.environ[name]
 
-            print(worker_environ)
-
             run_worker_futures: list[asyncio.Future[RunWorkerType]] = []
             for pipeline_rank in range(self.parallel_config.pipeline_parallel_size):
                 # try to fulfill as many workers as possible locally
@@ -222,7 +220,7 @@ class CustomExecutor(Executor):
                         rank = local_rank + pipeline_rank * tensor_parallel_size
                         create_worker = create_workers.pop()
                         run_worker_futures.append(
-                            loop.create_task(create_worker(self.vllm_config, rank))
+                            loop.create_task(create_worker(self.vllm_config, rank, worker_environ))
                         )
 
                     # the node may still be usable, if so readd it
@@ -522,10 +520,12 @@ async def remote_worker_async_main(server_ip: str, available_devices: int):
             peer.params["print"] = print
             peer.params["available_devices"] = available_devices
 
-            async def create_worker(vllm_config: VllmConfig, rank: int):
+            async def create_worker(vllm_config: VllmConfig, rank: int, environ: dict[str, str]) -> RunWorkerType:
                 nonlocal wrapper
                 if wrapper:
                     raise Exception("Worker already created.")
+                for name, value in environ.items():
+                    os.environ[name] = value
                 wrapper = WorkerWrapperBase(vllm_config=vllm_config, rpc_rank=rank)
                 run_worker = set_peer_run_worker(peer, wrapper, rank)
                 return run_worker
