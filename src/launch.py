@@ -8,16 +8,21 @@ import os
 import socket
 import sys
 import threading
+import traceback
 import weakref
 from argparse import Namespace
 from asyncio.events import AbstractEventLoop
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, List, Optional, Union
-import traceback
-import rpc
 
 import uvloop
+import vllm.entrypoints.cli.benchmark.main
+import vllm.entrypoints.cli.collect_env
+import vllm.entrypoints.cli.openai
+import vllm.entrypoints.cli.run_batch
+import vllm.engine.arg_utils
+import vllm.entrypoints.cli.serve
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
@@ -25,31 +30,23 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.openai.api_server import (
-    build_app,
-    build_async_engine_client_from_engine_args,
-    init_app_state,
-    load_log_config,
-    maybe_register_tokenizer_info_endpoint,
-    setup_server,
-)
-
+    build_app, build_async_engine_client_from_engine_args, init_app_state,
+    load_log_config, maybe_register_tokenizer_info_endpoint, setup_server)
 # yapf conflicts with isort for this block
 # yapf: disable
 # yapf: enable
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
 from vllm.logger import init_logger
-from vllm.utils import (
-    get_distributed_init_method,
-    get_ip,
-    get_open_port,
-    run_method,
-    cuda_device_count_stateless,
-)
+from vllm.platforms import current_platform
+from vllm.utils import (FlexibleArgumentParser, cuda_device_count_stateless,
+                        get_distributed_init_method, get_ip, get_open_port,
+                        run_method)
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.worker.worker_base import WorkerWrapperBase
-from vllm.platforms import current_platform
 
+import rpc
 import rpc_reader
 
 VLLM_SERVER_PORT = int(os.environ.get("VLLM_SERVER_PORT", 30044))
@@ -59,8 +56,20 @@ logger = init_logger("vllm.entrypoints.openai.api_server")
 RunWorkerType = Callable[[Union[str, bytes], Optional[int], Any, Any], Awaitable[Any]]
 CreateWorkerType = Callable[[VllmConfig, int], Awaitable[RunWorkerType]]
 
+
 class CustomExecutor(Executor):
     uses_ray: bool = False
+    # These env vars are worker-specific, therefore are NOT copied
+    # from the driver to the workers
+    WORKER_SPECIFIC_ENV_VARS = {
+        "VLLM_HOST_IP",
+        "VLLM_HOST_PORT",
+        "LOCAL_RANK",
+        "CUDA_VISIBLE_DEVICES",
+    }
+
+    # These non-vLLM env vars are copied from the driver to workers
+    ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -130,7 +139,9 @@ class CustomExecutor(Executor):
             loop = asyncio.get_event_loop()
             loop_ready.set_result(loop)
 
-            async def get_run_worker(local_rank: int, pipeline_rank: int) -> RunWorkerType:
+            async def get_run_worker(
+                local_rank: int, pipeline_rank: int
+            ) -> RunWorkerType:
                 rank = local_rank + pipeline_rank * tensor_parallel_size
                 parent_conn, child_conn = multiprocessing.Pipe()
                 process_kwargs = {
@@ -172,6 +183,20 @@ class CustomExecutor(Executor):
             if current_platform.is_cuda():
                 available_devices = cuda_device_count_stateless()
 
+            env_vars_to_copy = {
+                v
+                for v in set(envs.environment_variables).union(
+                    CustomExecutor.ADDITIONAL_ENV_VARS
+                )
+                if v not in CustomExecutor.WORKER_SPECIFIC_ENV_VARS
+            }
+            worker_environ = {}
+            for name in env_vars_to_copy:
+                if name in os.environ:
+                    worker_environ[name] = os.environ[name]
+
+            print(worker_environ)
+
             run_worker_futures: list[asyncio.Future[RunWorkerType]] = []
             for pipeline_rank in range(self.parallel_config.pipeline_parallel_size):
                 # try to fulfill as many workers as possible locally
@@ -195,7 +220,9 @@ class CustomExecutor(Executor):
                     for local_rank in range(tensor_parallel_size):
                         rank = local_rank + pipeline_rank * tensor_parallel_size
                         create_worker = create_workers.pop()
-                        run_worker_futures.append(loop.create_task(create_worker(self.vllm_config, rank)))
+                        run_worker_futures.append(
+                            loop.create_task(create_worker(self.vllm_config, rank))
+                        )
 
                     # the node may still be usable, if so readd it
                     # note: does this work? possibly different number of workers per node?
@@ -357,6 +384,11 @@ async def build_async_engine_client(
     engine_args = AsyncEngineArgs.from_cli_args(args)
     engine_args.distributed_executor_backend = CustomExecutor
 
+    def _is_v1_supported_oracle(model_config: Any):
+        return True
+
+    engine_args._is_v1_supported_oracle = _is_v1_supported_oracle
+
     async with build_async_engine_client_from_engine_args(
         engine_args, args.disable_frontend_multiprocessing, client_config
     ) as engine:
@@ -411,13 +443,9 @@ async def run_server(args, client_config=None, **uvicorn_kwargs) -> None:
 
 
 def vllm_main():
-    import vllm.entrypoints.cli.benchmark.main
-    import vllm.entrypoints.cli.collect_env
-    import vllm.entrypoints.cli.openai
-    import vllm.entrypoints.cli.run_batch
-    import vllm.entrypoints.cli.serve
-    from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
-    from vllm.utils import FlexibleArgumentParser
+    os.environ["RANK"] = "-1"
+    os.environ["LOCAL_RANK"] = "-1"
+    os.environ["VLLM_USE_V1"] = "1"
 
     CMD_MODULES = [
         vllm.entrypoints.cli.openai,
@@ -451,8 +479,6 @@ def vllm_main():
 
     # force external launcher and dummy up ranks that are checked by vllm
     args.distributed_executor_backend = "external_launcher"
-    os.environ["RANK"] = "-1"
-    os.environ["LOCAL_RANK"] = "-1"
 
     if hasattr(args, "model_tag") and args.model_tag is not None:
         args.model = args.model_tag
@@ -529,7 +555,9 @@ def gc_runner_loop(loop: AbstractEventLoop):
 def remote_worker_main(server_ip: str, available_devices: int, **kwargs):
     loop = asyncio.new_event_loop()
 
-    loop.run_until_complete(remote_worker_async_main(server_ip, available_devices, **kwargs))
+    loop.run_until_complete(
+        remote_worker_async_main(server_ip, available_devices, **kwargs)
+    )
     loop.close()
 
     gc_runner_loop(loop)
