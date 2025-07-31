@@ -97,7 +97,7 @@ class CustomExecutor(Executor):
             remote_node = pending_remote_nodes.get(remote_ip, [])
             pending_remote_nodes[remote_ip] = remote_node
 
-            rpc_transport = rpc_reader.RpcStreamTransport(reader, writer)
+            rpc_transport = rpc_reader.RpcPickleStreamTransport(reader, writer)
             loop = asyncio.get_event_loop()
             peer, readLoop = await rpc_reader.prepare_peer_readloop(loop, rpc_transport)
 
@@ -487,7 +487,7 @@ async def remote_worker_async_main(server_ip: str, available_devices: int):
             # Attempt to connect to the server
             reader, writer = await asyncio.open_connection(server_ip, VLLM_SERVER_PORT)
 
-            rpc_transport = rpc_reader.RpcStreamTransport(reader, writer)
+            rpc_transport = rpc_reader.RpcPickleStreamTransport(reader, writer)
             peer, readLoop = await rpc_reader.prepare_peer_readloop(loop, rpc_transport)
 
             peer.params["print"] = print
@@ -524,10 +524,10 @@ def gc_runner_loop(loop: AbstractEventLoop):
     gc_runner()
 
 
-def remote_worker_main(server_ip: str, **kwargs):
+def remote_worker_main(server_ip: str, available_devices: int, **kwargs):
     loop = asyncio.new_event_loop()
 
-    loop.run_until_complete(remote_worker_async_main(loop, server_ip, **kwargs))
+    loop.run_until_complete(remote_worker_async_main(server_ip, available_devices, **kwargs))
     loop.close()
 
     gc_runner_loop(loop)
@@ -542,15 +542,13 @@ def remote_main(server_ip: str):
     for _ in range(available_devices):
         worker = multiprocessing.Process(
             target=remote_worker_main,
-            args=(server_ip, available_devices),
+            args=[server_ip, available_devices],
             daemon=True,
         )
         workers.append(worker)
         worker.start()
 
-    alive_sentinels = [p.sentinel for p in workers]
-
-    multiprocessing.connection.wait([p.sentinel for p in alive_sentinels])
+    multiprocessing.connection.wait([p.sentinel for p in workers])
     print("A worker exited, shutting down node.")
 
     for worker in workers:
