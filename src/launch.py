@@ -15,14 +15,14 @@ from asyncio.events import AbstractEventLoop
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, List, Optional, Union
-import cloudpickle
 
+import cloudpickle
 import uvloop
+import vllm.engine.arg_utils
 import vllm.entrypoints.cli.benchmark.main
 import vllm.entrypoints.cli.collect_env
 import vllm.entrypoints.cli.openai
 import vllm.entrypoints.cli.run_batch
-import vllm.engine.arg_utils
 import vllm.entrypoints.cli.serve
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -107,7 +107,9 @@ class CustomExecutor(Executor):
             remote_node = pending_remote_nodes.get(remote_ip, [])
             pending_remote_nodes[remote_ip] = remote_node
 
-            rpc_transport = rpc_reader.RpcPickleStreamTransport(reader, writer, pickler=cloudpickle)
+            rpc_transport = rpc_reader.RpcPickleStreamTransport(
+                reader, writer, pickler=cloudpickle
+            )
             loop = asyncio.get_event_loop()
             peer, readLoop = await rpc_reader.prepare_peer_readloop(loop, rpc_transport)
 
@@ -220,7 +222,9 @@ class CustomExecutor(Executor):
                         rank = local_rank + pipeline_rank * tensor_parallel_size
                         create_worker = create_workers.pop()
                         run_worker_futures.append(
-                            loop.create_task(create_worker(self.vllm_config, rank, worker_environ))
+                            loop.create_task(
+                                create_worker(self.vllm_config, rank, worker_environ)
+                            )
                         )
 
                     # the node may still be usable, if so readd it
@@ -346,30 +350,22 @@ class CustomExecutor(Executor):
         if self.is_failed:
             raise RuntimeError("Executor failed.")
 
-        async def run_workers():
-            run_worker_result_coros: list[asyncio.Future[Any]] = []
-            for run_worker in self.workers:
-                task = asyncio.create_task(
-                    run_worker(method, unique_reply_rank, list(args), kwargs)
-                )
-                run_worker_result_coros.append(task)
+        futures: list[concurrent.futures.Future[Any]] = []
 
-            result = await asyncio.gather(*run_worker_result_coros)
-            result = (
-                [result[unique_reply_rank]]
-                if unique_reply_rank is not None
-                else result
+        for run_worker in self.workers:
+            future = asyncio.run_coroutine_threadsafe(
+                run_worker(method, unique_reply_rank, list(args), kwargs)
             )
-            return result
+            futures.append(future)
 
-        run_worker_results_future = asyncio.run_coroutine_threadsafe(
-            run_workers(), self.loop
+        futures = (
+            [futures[unique_reply_rank]] if unique_reply_rank is not None else futures
         )
 
         if non_block:
-            return run_worker_results_future
+            return futures
 
-        worker_outputs = run_worker_results_future.result()
+        worker_outputs = [f.result() for f in futures]
         return worker_outputs
 
     def check_health(self):
@@ -519,13 +515,17 @@ async def remote_worker_async_main(server_ip: str, available_devices: int):
             # Attempt to connect to the server
             reader, writer = await asyncio.open_connection(server_ip, VLLM_SERVER_PORT)
 
-            rpc_transport = rpc_reader.RpcPickleStreamTransport(reader, writer, pickler=cloudpickle)
+            rpc_transport = rpc_reader.RpcPickleStreamTransport(
+                reader, writer, pickler=cloudpickle
+            )
             peer, readLoop = await rpc_reader.prepare_peer_readloop(loop, rpc_transport)
 
             peer.params["print"] = print
             peer.params["available_devices"] = available_devices
 
-            async def create_worker(vllm_config: VllmConfig, rank: int, environ: dict[str, str]) -> RunWorkerType:
+            async def create_worker(
+                vllm_config: VllmConfig, rank: int, environ: dict[str, str]
+            ) -> RunWorkerType:
                 nonlocal wrapper
                 if wrapper:
                     raise Exception("Worker already created.")
