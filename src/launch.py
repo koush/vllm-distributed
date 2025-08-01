@@ -354,7 +354,7 @@ class CustomExecutor(Executor):
 
         for run_worker in self.workers:
             future = asyncio.run_coroutine_threadsafe(
-                run_worker(method, unique_reply_rank, list(args), kwargs)
+                run_worker(method, unique_reply_rank, list(args), kwargs), loop=self.loop
             )
             futures.append(future)
 
