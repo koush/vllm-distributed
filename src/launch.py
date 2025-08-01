@@ -352,7 +352,8 @@ class CustomExecutor(Executor):
 
         for run_worker in self.workers:
             future = asyncio.run_coroutine_threadsafe(
-                run_worker(method, unique_reply_rank, list(args), kwargs), loop=self.loop
+                run_worker(method, unique_reply_rank, list(args), kwargs),
+                loop=self.loop,
             )
             futures.append(future)
 
@@ -382,10 +383,10 @@ async def build_async_engine_client(
     engine_args = AsyncEngineArgs.from_cli_args(args)
     engine_args.distributed_executor_backend = CustomExecutor
 
-    def _is_v1_supported_oracle(model_config: Any):
-        return True
+    # need to set this so it does not fall back to v0
+    from vllm.config import ParallelConfig
 
-    engine_args._is_v1_supported_oracle = _is_v1_supported_oracle
+    ParallelConfig.distributed_executor_backend = CustomExecutor
 
     async with build_async_engine_client_from_engine_args(
         engine_args, args.disable_frontend_multiprocessing, client_config
