@@ -551,7 +551,8 @@ async def remote_worker_async_main(server_ip: str, available_devices: int):
             # once a worker has been created the entire node needs to tear down and restart.
             traceback.print_exc()
             if wrapper:
-                raise
+                print("Running worker was terminated, shutting down.")
+                sys.exit(1)
             print(
                 f"Connection to {server_ip}:{VLLM_SERVER_PORT} failed. Retrying momentarily..."
             )
