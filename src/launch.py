@@ -130,10 +130,19 @@ class CustomExecutor(Executor):
                 traceback.print_exc()
             finally:
                 print(f"Closing connection {addr}")
-                # remove from remote_worker list
-                remote_node.remove(create_worker)
+                # remove from remote_worker list if it is not used
+                if create_worker not in remote_node:
+                    # the worker was used, so this means the executor is in failed state
+                    self.is_failed = True
+                    if self.failure_callback:
+                        self.failure_callback()
+                else:
+                    remote_node.remove(create_worker)
                 writer.close()
                 await writer.wait_closed()
+                if self.is_failed:
+                    print("Executor failed, shutting down.")
+                    sys.exit(1)
 
         loop_ready = concurrent.futures.Future[AbstractEventLoop]()
         workers_ready = concurrent.futures.Future[tuple[int, list[RunWorkerType]]]()
