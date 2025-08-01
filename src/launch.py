@@ -355,18 +355,21 @@ class CustomExecutor(Executor):
                 run_worker_result_coros.append(task)
 
             result = await asyncio.gather(*run_worker_result_coros)
+            result = (
+                [result[unique_reply_rank]]
+                if unique_reply_rank is not None
+                else result
+            )
             return result
 
         run_worker_results_future = asyncio.run_coroutine_threadsafe(
             run_workers(), self.loop
         )
 
+        if non_block:
+            return run_worker_results_future
+
         worker_outputs = run_worker_results_future.result()
-        worker_outputs = (
-            [worker_outputs[unique_reply_rank]]
-            if unique_reply_rank is not None
-            else worker_outputs
-        )
         return worker_outputs
 
     def check_health(self):
