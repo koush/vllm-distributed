@@ -2,7 +2,6 @@ services:
   vllm-distributed:
     # image: nvcr.io/nvidia/tritonserver:25.06-vllm-python-py3
     image: vllm-fixed
-    container_name: vllm-distributed
     build:
       context: .
       dockerfile: Dockerfile.vllm
