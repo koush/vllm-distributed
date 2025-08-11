@@ -237,12 +237,14 @@ class CustomExecutor(Executor):
                 # try to fulfill as many workers as possible locally
                 if can_use_local_workers():
                     for local_rank in range(tensor_parallel_size):
+                        if not available_devices:
+                            break
                         run_worker_futures.append(
                             asyncio.create_task(
                                 get_run_worker(local_rank, pipeline_rank)
                             )
                         )
-                    available_devices -= tensor_parallel_size
+                        available_devices -= 1
                 else:
                     create_workers = await remote_nodes.get()
                     # node is not usable
