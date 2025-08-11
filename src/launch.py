@@ -207,10 +207,35 @@ class CustomExecutor(Executor):
                 if name in os.environ:
                     worker_environ[name] = os.environ[name]
 
+            def can_use_local_workers():
+                nonlocal available_devices
+                if not available_devices:
+                    return False
+
+                if available_devices >= tensor_parallel_size:
+                    return True
+                
+                if os.environ.get("VLLM_REMOTE_TP", "0") == "1":
+                    return True
+                
+                return False
+            
+            def can_use_remote_workers(create_workers):
+                if not len(create_workers):
+                    return False
+                
+                if len(create_workers) >= tensor_parallel_size:
+                    return True
+  
+                if os.environ.get("VLLM_REMOTE_TP", "0") == "1":
+                    return True
+
+                return False
+
             run_worker_futures: list[asyncio.Future[RunWorkerType]] = []
             for pipeline_rank in range(self.parallel_config.pipeline_parallel_size):
                 # try to fulfill as many workers as possible locally
-                if available_devices >= tensor_parallel_size:
+                if can_use_local_workers():
                     for local_rank in range(tensor_parallel_size):
                         run_worker_futures.append(
                             asyncio.create_task(
@@ -221,7 +246,7 @@ class CustomExecutor(Executor):
                 else:
                     create_workers = await remote_nodes.get()
                     # node is not usable
-                    if len(create_workers) < tensor_parallel_size:
+                    if not can_use_remote_workers(create_workers):
                         print(
                             f"WARNING: Not enough workers on remote node {create_workers}, skipping... this may be a bug."
                         )
