@@ -164,12 +164,14 @@ class CustomExecutor(Executor):
 
         loop_ready = concurrent.futures.Future[AbstractEventLoop]()
         workers_ready = concurrent.futures.Future[tuple[int, list[RunWorkerType]]]()
+        lr = 0
 
         async def spawn_and_listen_for_workers():
             loop = asyncio.get_event_loop()
             loop_ready.set_result(loop)
 
             async def get_run_worker(rank: int) -> RunWorkerType:
+                nonlocal lr
                 parent_conn, child_conn = multiprocessing.Pipe()
                 process_kwargs = {
                     "vllm_config": self.vllm_config,
@@ -177,10 +179,11 @@ class CustomExecutor(Executor):
                 }
                 worker = multiprocessing.Process(
                     target=worker_main,
-                    args=(child_conn,),
+                    args=(child_conn,lr),
                     kwargs=process_kwargs,
                     daemon=True,
                 )
+                lr = lr + 1
                 worker.start()
 
                 rpcTransport = rpc_reader.RpcConnectionTransport(parent_conn)
@@ -683,13 +686,14 @@ async def worker_async_main(
     rpc_transport: rpc_reader.RpcTransport,
     vllm_config: VllmConfig,
     rank: int,
+    local_rank: int,
 ):
     loop = asyncio.get_event_loop()
     peer, readLoop = await rpc_reader.prepare_peer_readloop(loop, rpc_transport)
     peer.params["print"] = print
 
     wrapper = WorkerWrapperBase(vllm_config=vllm_config, rpc_rank=rank)
-    set_peer_run_worker(peer, wrapper, rank)
+    set_peer_run_worker(peer, wrapper, rank, local_rank)
 
     try:
         await readLoop()
@@ -699,6 +703,7 @@ async def worker_async_main(
 
 def worker_main(
     conn: multiprocessing.connection.Connection,
+    local_rank: int,
     **kwargs,
 ):
     rpc_transport = rpc_reader.RpcConnectionTransport(conn)
@@ -706,7 +711,7 @@ def worker_main(
 
     gc_runner_loop(loop)
 
-    loop.run_until_complete(worker_async_main(rpc_transport, **kwargs))
+    loop.run_until_complete(worker_async_main(rpc_transport, local_rank=local_rank, **kwargs))
     loop.close()
 
 
