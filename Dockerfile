@@ -3,7 +3,7 @@ FROM vllm/vllm-openai:latest-x86_64
 RUN pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu129
 
 # needed for nvfp4
-RUN pip3 install -U flashinfer-python==0.3.1
+RUN pip3 install -U flashinfer-python==0.3.1.post1
 
 #RUN apt -y install openssh-server && mkdir -p /run/sshd && ssh-keygen -A
 # enable permit root login
