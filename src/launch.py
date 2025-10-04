@@ -1,0 +1,680 @@
+import asyncio
+import concurrent.futures
+import gc
+import importlib
+import multiprocessing
+import multiprocessing.connection
+import os
+import sys
+import threading
+import traceback
+import weakref
+from argparse import Namespace
+from asyncio.events import AbstractEventLoop
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, List, Optional, Union
+
+import cloudpickle
+import uvloop
+import vllm.engine.arg_utils
+import vllm.entrypoints.cli.benchmark.main
+import vllm.entrypoints.cli.collect_env
+import vllm.entrypoints.cli.openai
+import vllm.entrypoints.cli.run_batch
+import vllm.entrypoints.cli.serve
+import vllm.envs as envs
+from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.launcher import serve_http
+from vllm.entrypoints.openai.api_server import (
+    build_app, build_async_engine_client_from_engine_args, init_app_state,
+    load_log_config, maybe_register_tokenizer_info_endpoint, setup_server)
+# yapf conflicts with isort for this block
+# yapf: disable
+# yapf: enable
+from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
+from vllm.utils import (FlexibleArgumentParser, cuda_device_count_stateless,
+                        get_distributed_init_method, get_ip, get_open_port,
+                        run_method)
+from vllm.v1.executor.abstract import Executor, FailureCallback
+from vllm.v1.outputs import ModelRunnerOutput
+from vllm.worker.worker_base import WorkerWrapperBase
+
+import rpc
+import rpc_reader
+
+VLLM_SERVER_PORT = int(os.environ.get("VLLM_SERVER_PORT", 30044))
+
+logger = init_logger("vllm.entrypoints.openai.api_server")
+
+RunWorkerType = Callable[[Union[str, bytes], Optional[int], Any, Any], Awaitable[Any]]
+CreateWorkerType = Callable[[VllmConfig, int, dict[str, str]], Awaitable[RunWorkerType]]
+
+
+class CustomExecutor(Executor):
+    uses_ray: bool = False
+    # These env vars are worker-specific, therefore are NOT copied
+    # from the driver to the workers
+    WORKER_SPECIFIC_ENV_VARS = {
+        "VLLM_HOST_IP",
+        "VLLM_HOST_PORT",
+        "LOCAL_RANK",
+        "CUDA_VISIBLE_DEVICES",
+    }
+
+    # These non-vLLM env vars are copied from the driver to workers
+    ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def _init_executor(self):
+        # Call self.shutdown at exit to clean up
+        # and ensure workers will be terminated.
+        self._finalizer = weakref.finalize(self, self.shutdown)
+        self.is_failed = False
+        self.shutdown_event = threading.Event()
+        self.failure_callback: Optional[FailureCallback] = None
+
+        self.world_size = self.parallel_config.world_size
+        tensor_parallel_size = self.parallel_config.tensor_parallel_size
+        pp_parallel_size = self.parallel_config.pipeline_parallel_size
+        assert self.world_size == tensor_parallel_size * pp_parallel_size, (
+            f"world_size ({self.world_size}) must be equal to the "
+            f"tensor_parallel_size ({tensor_parallel_size}) x pipeline"
+            f"_parallel_size ({pp_parallel_size}). "
+        )
+
+        distributed_init_method = get_distributed_init_method(get_ip(), get_open_port())
+
+        remote_nodes = asyncio.queues.Queue[list[CreateWorkerType]]()
+        pending_remote_nodes: dict[str, list[RunWorkerType]] = {}
+
+        async def handle_client(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ):
+            addr = writer.get_extra_info("peername")
+            logger.info(f"Connection from {addr}")
+
+            remote_ip, remote_port = addr
+            remote_node = pending_remote_nodes.get(remote_ip, [])
+            pending_remote_nodes[remote_ip] = remote_node
+
+            rpc_transport = rpc_reader.RpcPickleStreamTransport(
+                reader, writer, pickler=cloudpickle
+            )
+            loop = asyncio.get_event_loop()
+            peer, readLoop = await rpc_reader.prepare_peer_readloop(loop, rpc_transport)
+
+            loop_task = loop.create_task(readLoop())
+
+            create_worker: CreateWorkerType = None
+
+            try:
+                available_devices: int = await peer.getParam("available_devices")
+                create_worker = await peer.getParam("create_worker")
+                remote_node.append(create_worker)
+                # after the remote node has all available devices
+                if len(remote_node) == available_devices:
+                    remote_nodes.put_nowait(remote_node)
+                await loop_task
+            except:
+                logger.error(f"Error handling client {addr}")
+                traceback.print_exc()
+            finally:
+                logger.info(f"Closing connection {addr}")
+                # remove from remote_worker list if it is not used
+                if create_worker not in remote_node:
+                    # the worker was used, so this means the executor is in failed state
+                    self.is_failed = True
+                    if self.failure_callback:
+                        self.failure_callback()
+                else:
+                    remote_node.remove(create_worker)
+                writer.close()
+                await writer.wait_closed()
+                if self.is_failed:
+                    logger.error("Executor failed, shutting down.")
+                    sys.exit(1)
+
+        loop_ready = concurrent.futures.Future[AbstractEventLoop]()
+        workers_ready = concurrent.futures.Future[tuple[int, list[RunWorkerType]]]()
+
+        async def spawn_and_listen_for_workers():
+            loop = asyncio.get_event_loop()
+            loop_ready.set_result(loop)
+
+            async def get_run_worker(
+                rank: int,
+                local_rank: int,
+            ) -> RunWorkerType:
+                parent_conn, child_conn = multiprocessing.Pipe()
+                worker = multiprocessing.Process(
+                    target=worker_main,
+                    args=(child_conn,),
+                    kwargs={
+                        "vllm_config": self.vllm_config,
+                        "rank": rank,
+                        "local_rank": local_rank,
+                    },
+                    daemon=True,
+                )
+                worker.start()
+
+                rpcTransport = rpc_reader.RpcConnectionTransport(parent_conn)
+                forkPeer, readLoop = await rpc_reader.prepare_peer_readloop(
+                    loop, rpcTransport
+                )
+                forkPeer.peerName = "vllm-worker"
+
+                async def workerReadLoop():
+                    try:
+                        await readLoop()
+                    except:
+                        import traceback
+
+                        traceback.print_exc()
+                        logger.info("worker read loop exited")
+                    finally:
+                        parent_conn.close()
+                        rpcTransport.executor.shutdown()
+                        worker.terminate()
+
+                asyncio.run_coroutine_threadsafe(workerReadLoop(), loop=loop)
+                return await forkPeer.getParam("run_worker")
+
+            need_devices = self.world_size
+            available_devices = 1
+            if current_platform.is_cuda():
+                available_devices = cuda_device_count_stateless()
+            used_devices = 0
+
+            env_vars_to_copy = {
+                v
+                for v in set(envs.environment_variables).union(
+                    CustomExecutor.ADDITIONAL_ENV_VARS
+                )
+                if v not in CustomExecutor.WORKER_SPECIFIC_ENV_VARS
+            }
+            worker_environ = {}
+            for name in env_vars_to_copy:
+                if name in os.environ:
+                    worker_environ[name] = os.environ[name]
+
+            run_worker_futures: list[asyncio.Future[RunWorkerType]] = []
+            for pipeline_rank in range(self.parallel_config.pipeline_parallel_size):
+                # try to fulfill as many workers as possible locally
+                if available_devices >= tensor_parallel_size:
+                    for tp_rank in range(tensor_parallel_size):
+                        rank = pipeline_rank * tensor_parallel_size + tp_rank
+                        local_rank = used_devices + tp_rank
+                        run_worker_futures.append(
+                            asyncio.create_task(
+                                get_run_worker(rank, local_rank)
+                            )
+                        )
+                    available_devices -= tensor_parallel_size
+                    used_devices += tensor_parallel_size
+                else:
+                    create_workers = await remote_nodes.get()
+                    # node is not usable
+                    if len(create_workers) < tensor_parallel_size:
+                        logger.warning(
+                            f"WARNING: Not enough workers on remote node {create_workers}, skipping... this may be a bug."
+                        )
+                        continue
+
+                    for tp_rank in range(tensor_parallel_size):
+                        rank = tp_rank + pipeline_rank * tensor_parallel_size
+                        create_worker = create_workers.pop()
+                        run_worker_futures.append(
+                            loop.create_task(
+                                create_worker(self.vllm_config, rank, worker_environ)
+                            )
+                        )
+
+                    # the node may still be usable, if so readd it
+                    # note: does this work? possibly different number of workers per node?
+                    if len(create_workers) >= tensor_parallel_size:
+                        remote_nodes.put_nowait(create_workers)
+
+                need_devices -= tensor_parallel_size
+
+            run_workers: list[RunWorkerType] = []
+            for future in run_worker_futures:
+                run_workers.append(await future)
+            return run_workers
+
+        async def worker_loop():
+            server = await asyncio.start_server(
+                handle_client, "0.0.0.0", VLLM_SERVER_PORT
+            )
+            logger.info(f"Server listening on 0.0.0.0:{VLLM_SERVER_PORT}")
+            run_workers = await spawn_and_listen_for_workers()
+            workers_ready.set_result((VLLM_SERVER_PORT, run_workers))
+
+            async with server:
+                await server.serve_forever()
+
+        def worker_thread():
+            uvloop.run(worker_loop())
+
+        threading.Thread(target=worker_thread, daemon=True).start()
+        port, run_workers = workers_ready.result()
+        self.loop = loop_ready.result()
+
+        self.workers: List[RunWorkerType] = run_workers
+
+        all_kwargs = []
+
+        for pipeline_rank in range(self.parallel_config.pipeline_parallel_size):
+            for local_rank in range(self.parallel_config.tensor_parallel_size):
+                rank = local_rank + pipeline_rank * tensor_parallel_size
+                kwargs = dict(
+                    vllm_config=self.vllm_config,
+                    # local rank is clobbered inside WorkerWrapper
+                    local_rank=-1,
+                    rank=rank,
+                    distributed_init_method=distributed_init_method,
+                    is_driver_worker=(not self.parallel_config)
+                    or (rank % self.parallel_config.tensor_parallel_size == 0),
+                )
+                all_kwargs.append(kwargs)
+
+        self.collective_rpc("init_worker", args=[all_kwargs])
+        self.collective_rpc("init_device")
+        self.collective_rpc("load_model")
+
+        self.output_rank = self._get_output_rank()
+        self.has_connector = self.vllm_config.kv_transfer_config is not None
+        self.kv_output_aggregator = KVOutputAggregator(self.parallel_config.world_size)
+
+    @property
+    def max_concurrent_batches(self) -> int:
+        if self.scheduler_config.async_scheduling:
+            return 2
+        return self.parallel_config.pipeline_parallel_size
+
+    def _get_output_rank(self) -> int:
+        # Only returns ModelRunnerOutput from TP rank=0 and PP rank=-1
+        # (the first TP worker of the last PP stage).
+        # Example:
+        # Assuming TP=8, PP=4, then the world_size=32
+        # 0-7, PP rank 0
+        # 8-15, PP rank 1
+        # 16-23, PP rank 2
+        # 24-31, PP rank 3
+        # so world_size - tp_size = 32 - 8 = 24 should be PP rank = -1 (i.e. 3)
+        return self.world_size - self.parallel_config.tensor_parallel_size
+
+    def register_failure_callback(self, callback: FailureCallback):
+        if self.is_failed:
+            callback()
+        else:
+            self.failure_callback = callback
+
+    def execute_model(
+        self,
+        scheduler_output,
+    ) -> Union[ModelRunnerOutput, concurrent.futures.Future[ModelRunnerOutput]]:
+        non_block = self.max_concurrent_batches > 1
+
+        if not self.has_connector:
+            # get output only from a single worker (output_rank)
+            (output,) = self.collective_rpc(
+                "execute_model",
+                args=(scheduler_output,),
+                unique_reply_rank=self.output_rank,
+                non_block=non_block,
+                timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+            )
+            return output
+
+        # get output from all workers
+        outputs = self.collective_rpc(
+            "execute_model",
+            args=(scheduler_output,),
+            non_block=non_block,
+            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+        )
+
+        # aggregate all workers output to a single output
+        if non_block:
+            return self.kv_output_aggregator.async_aggregate(outputs, self.output_rank)
+        return self.kv_output_aggregator.aggregate(outputs, self.output_rank)
+
+    def collective_rpc(
+        self,
+        method: Union[str, Callable],
+        timeout: Optional[float] = None,
+        args: tuple = (),
+        kwargs: Optional[dict] = None,
+        non_block: bool = False,
+        unique_reply_rank: Optional[int] = None,
+    ) -> list[Any]:
+        if self.is_failed:
+            raise RuntimeError("Executor failed.")
+
+        futures: list[concurrent.futures.Future[Any]] = []
+
+        for run_worker in self.workers:
+            # ensure RpcProxy is never used.
+            async def coro(w, p):
+                ret = await w(p)
+                return cloudpickle.loads(ret)
+            future = asyncio.run_coroutine_threadsafe(
+                coro(run_worker, cloudpickle.dumps([method, unique_reply_rank, list(args), kwargs])),
+                loop=self.loop,
+            )
+            futures.append(future)
+
+        futures = (
+            [futures[unique_reply_rank]] if unique_reply_rank is not None else futures
+        )
+
+        if non_block:
+            return futures
+
+        worker_outputs = [f.result() for f in futures]
+        return worker_outputs
+
+    def check_health(self):
+        self.collective_rpc("check_health", timeout=10)
+        return
+
+
+@asynccontextmanager
+async def build_async_engine_client(
+    args: Namespace,
+    client_config: Optional[dict[str, Any]] = None,
+) -> AsyncIterator[EngineClient]:
+
+    # Context manager to handle engine_client lifecycle
+    # Ensures everything is shutdown and cleaned up on error/exit
+    engine_args = AsyncEngineArgs.from_cli_args(args)
+    engine_args.distributed_executor_backend = CustomExecutor
+
+    # need to set this so it does not fall back to v0
+    from vllm.config import ParallelConfig
+
+    ParallelConfig.distributed_executor_backend = CustomExecutor
+
+    async with build_async_engine_client_from_engine_args(
+        engine_args, disable_frontend_multiprocessing=args.disable_frontend_multiprocessing, client_config=client_config
+    ) as engine:
+        yield engine
+
+
+async def run_server(args, client_config=None, **uvicorn_kwargs) -> None:
+    """Run a single-worker API server."""
+    listen_address, sock = setup_server(args)
+
+    if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
+        ToolParserManager.import_tool_parser(args.tool_parser_plugin)
+
+    server_index = client_config.get("client_index", 0) if client_config else 0
+
+    # Load logging config for uvicorn if specified
+    log_config = load_log_config(args.log_config_file)
+    if log_config is not None:
+        uvicorn_kwargs["log_config"] = log_config
+
+    async with build_async_engine_client(args, client_config) as engine_client:
+        maybe_register_tokenizer_info_endpoint(args)
+        app = build_app(args)
+
+        vllm_config = await engine_client.get_vllm_config()
+        await init_app_state(engine_client, vllm_config, app.state, args)
+
+        logger.info("Starting vLLM API server %d on %s", server_index, listen_address)
+        shutdown_task = await serve_http(
+            app,
+            sock=sock,
+            enable_ssl_refresh=args.enable_ssl_refresh,
+            host=args.host,
+            port=args.port,
+            log_level=args.uvicorn_log_level,
+            # NOTE: When the 'disable_uvicorn_access_log' value is True,
+            # no access log will be output.
+            access_log=not args.disable_uvicorn_access_log,
+            timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+            ssl_keyfile=args.ssl_keyfile,
+            ssl_certfile=args.ssl_certfile,
+            ssl_ca_certs=args.ssl_ca_certs,
+            ssl_cert_reqs=args.ssl_cert_reqs,
+            **uvicorn_kwargs,
+        )
+
+    # NB: Await server shutdown only after the backend context is exited
+    try:
+        await shutdown_task
+    finally:
+        sock.close()
+
+
+def vllm_main():
+    os.environ["RANK"] = "-1"
+    os.environ["LOCAL_RANK"] = "-1"
+    os.environ["VLLM_USE_V1"] = "1"
+
+    CMD_MODULES = [
+        vllm.entrypoints.cli.openai,
+        vllm.entrypoints.cli.serve,
+        vllm.entrypoints.cli.benchmark.main,
+        vllm.entrypoints.cli.collect_env,
+        vllm.entrypoints.cli.run_batch,
+    ]
+
+    cli_env_setup()
+
+    parser = FlexibleArgumentParser(
+        description="vLLM CLI",
+        epilog=VLLM_SUBCMD_PARSER_EPILOG,
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=importlib.metadata.version("vllm"),
+    )
+    subparsers = parser.add_subparsers(required=False, dest="subparser")
+    cmds = {}
+    for cmd_module in CMD_MODULES:
+        new_cmds = cmd_module.cmd_init()
+        for cmd in new_cmds:
+            cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
+            cmds[cmd.name] = cmd
+
+    args = parser.parse_args()
+
+    # force external launcher and dummy up ranks that are checked by vllm
+    args.distributed_executor_backend = "external_launcher"
+
+    if hasattr(args, "model_tag") and args.model_tag is not None:
+        args.model = args.model_tag
+
+    if args.subparser in cmds:
+        cmds[args.subparser].validate(args)
+
+    if hasattr(args, "dispatch_function"):
+        uvloop.run(run_server(args))
+    else:
+        parser.print_help()
+
+
+class WorkerWrapper(WorkerWrapperBase):
+    def __init__(self, vllm_config, rpc_rank: int, local_rank: int):
+        super().__init__(vllm_config, rpc_rank)
+        self.local_rank = local_rank
+        logger.info(f"WorkerWrapper created for rpc_rank {rpc_rank}, local_rank {local_rank}")
+
+    def init_worker(self, all_kwargs):
+        kwargs = all_kwargs[self.rpc_rank]
+        # the main server doesn't know what the rank is and passes -1, so ckibber it here.
+        kwargs["local_rank"] = self.local_rank
+        return super().init_worker(all_kwargs)
+
+
+def set_peer_run_worker(peer: rpc.RpcPeer, wrapper: WorkerWrapper, rank: int, local_rank: int):
+    async def run_worker(pickled: Any):
+        method, unique_reply_rank, args, kwargs = cloudpickle.loads(pickled)
+        args = args or []
+        kwargs = kwargs or {}
+        try:
+            results = run_method(wrapper, method, args, kwargs)
+            results = cloudpickle.dumps(results)
+        except Exception as e:
+            logger.error("Error occurred while running method '%s': %s", method, e)
+            f = traceback.format_exc()
+            logger.error("Traceback: %s", f)
+            raise e
+        if unique_reply_rank is not None and unique_reply_rank != rank:
+            return None
+        return results
+
+    peer.params["run_worker"] = run_worker
+    return run_worker
+
+async def remote_worker_async_main(server_ip: str, available_devices: int, local_rank: int):
+    loop = asyncio.get_event_loop()
+    wrapper: WorkerWrapper = None
+    while True:
+        try:
+            # Attempt to connect to the server
+            reader, writer = await asyncio.open_connection(server_ip, VLLM_SERVER_PORT)
+
+            rpc_transport = rpc_reader.RpcPickleStreamTransport(
+                reader, writer, pickler=cloudpickle
+            )
+            peer, readLoop = await rpc_reader.prepare_peer_readloop(loop, rpc_transport)
+
+            peer.params["print"] = print
+            peer.params["available_devices"] = available_devices
+            peer.params["local_rank"] = local_rank
+
+            async def create_worker(
+                vllm_config: VllmConfig, rank: int, environ: dict[str, str]
+            ) -> RunWorkerType:
+                nonlocal wrapper
+                if wrapper:
+                    raise Exception("Worker already created.")
+                for name, value in environ.items():
+                    os.environ[name] = value
+                wrapper = WorkerWrapper(vllm_config=vllm_config, rpc_rank=rank, local_rank=local_rank)
+                run_worker = set_peer_run_worker(peer, wrapper, rank, local_rank)
+                return run_worker
+
+            peer.params["create_worker"] = create_worker
+
+            await readLoop()
+        except:
+            # allow retrying as long as a worker has never been created.
+            # once a worker has been created the entire node needs to tear down and restart.
+            traceback.print_exc()
+            if wrapper:
+                logger.error("Running worker was terminated, shutting down.")
+                sys.exit(1)
+                break
+            logger.info(
+                f"Connection to {server_ip}:{VLLM_SERVER_PORT} failed. Retrying momentarily..."
+            )
+            await asyncio.sleep(10)
+
+
+def gc_runner_loop(loop: AbstractEventLoop):
+    def gc_runner():
+        gc.collect()
+        loop.call_later(10, gc_runner)
+
+    gc_runner()
+
+
+def remote_worker_main(server_ip: str, available_devices: int, local_rank: int, **kwargs):
+    loop = asyncio.new_event_loop()
+
+    loop.run_until_complete(
+        remote_worker_async_main(server_ip, available_devices, local_rank, **kwargs)
+    )
+    loop.close()
+
+    gc_runner_loop(loop)
+
+
+def remote_main(server_ip: str):
+    available_devices = 1
+    if current_platform.is_cuda():
+        available_devices = cuda_device_count_stateless()
+
+    workers: list[multiprocessing.Process] = []
+    for local_rank in range(available_devices):
+        worker = multiprocessing.Process(
+            target=remote_worker_main,
+            args=[server_ip, available_devices, local_rank],
+            daemon=True,
+        )
+        workers.append(worker)
+        worker.start()
+
+    multiprocessing.connection.wait([p.sentinel for p in workers])
+    logger.error("A worker exited, shutting down node.")
+
+    for worker in workers:
+        worker.terminate()
+
+    for worker in workers:
+        worker.join()
+
+    sys.exit(1)
+
+
+async def worker_async_main(
+    rpc_transport: rpc_reader.RpcTransport,
+    vllm_config: VllmConfig,
+    rank: int,
+    local_rank: int,
+):
+    loop = asyncio.get_event_loop()
+    peer, readLoop = await rpc_reader.prepare_peer_readloop(loop, rpc_transport)
+    peer.params["print"] = print
+    peer.params["local_rank"] = local_rank
+
+    wrapper = WorkerWrapper(vllm_config=vllm_config, rpc_rank=rank, local_rank=local_rank)
+    set_peer_run_worker(peer, wrapper, rank, local_rank)
+
+    try:
+        await readLoop()
+    finally:
+        os._exit(0)
+
+
+def worker_main(
+    conn: multiprocessing.connection.Connection,
+    **kwargs,
+):
+    rpc_transport = rpc_reader.RpcConnectionTransport(conn)
+    loop = asyncio.new_event_loop()
+
+    gc_runner_loop(loop)
+
+    loop.run_until_complete(worker_async_main(rpc_transport, **kwargs))
+    loop.close()
+
+
+def main():
+    # if first arg is worker, launch the worker with the ip
+    if sys.argv[1] != "remote":
+        vllm_main()
+        return
+
+    server_ip = sys.argv[2]
+    remote_main(server_ip)
+
+
+if __name__ == "__main__":
+    main()

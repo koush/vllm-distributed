@@ -1,0 +1,61 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger",
+            "type": "debugpy",
+            // "subProcess": false,
+            "justMyCode": false,
+            "request": "launch",
+            "program": "${workspaceFolder}/launch.py",
+            "console": "integratedTerminal",
+            "args": [
+                "serve",
+                "koushd/Qwen3-Coder-480B-A35B-Instruct-AWQ",
+                "--api-key",
+                "token-abc123",
+                "-tp",
+                "2",
+                "-pp",
+                "2",
+                "--max-model-len",
+                "262144",
+                "--served-model-name",
+                "qwen3",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "qwen3_coder",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "8000",
+            ],
+            "env": {
+                "VLLM_HOST_IP": "192.168.2.142",
+                "NCCL_SOCKET_IFNAME": "eth0",
+                "GLOO_SOCKET_IFNAME": "eth0",
+            }
+        },
+        {
+            "name": "Client",
+            "type": "debugpy",
+            "subProcess": false,
+            "justMyCode": false,
+            "request": "launch",
+            "program": "${workspaceFolder}/launch.py",
+            "console": "integratedTerminal",
+            "args": [
+                "remote",
+                "192.168.2.142"
+            ],
+            "env": {
+                "VLLM_HOST_IP": "192.168.2.105",
+                "NCCL_SOCKET_IFNAME": "eth0",
+                "GLOO_SOCKET_IFNAME": "eth0",
+            }
+        },
+    ]
+}

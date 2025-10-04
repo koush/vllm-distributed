@@ -1,0 +1,43 @@
+services:
+  vllm-distributed:
+    # image: nvcr.io/nvidia/tritonserver:25.06-vllm-python-py3
+    image: vllm-fixed
+    container_name: vllm-distributed
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    shm_size: 16G
+#    devices:
+#      - /dev/infiniband:/dev/infiniband
+    volumes:
+#      - /sys/class/infiniband:/sys/class/infiniband:ro
+#      - /dev/infiniband:/dev/infiniband
+      - /dev/shm:/dev/shm
+      - ${ROOT_CACHE_PATH}:/root/.cache
+      - ./src:/distributed
+    security_opt:
+      - seccomp:unconfined
+    cap_add:
+      - IPC_LOCK
+    environment:
+      - HUGGING_FACE_HUB_TOKEN
+      - VLLM_HOST_IP=${VLLM_HOST_IP:-127.0.0.1}
+      - VLLM_USE_MODELSCOPE
+      - VLLM_PP_LAYER_PARTITION
+      - NCCL_SOCKET_IFNAME
+      - GLOO_SOCKET_IFNAME
+      - NCCL_DEBUG=TRACE
+    network_mode: host
+    ipc: host
+    entrypoint: []
+    command: python3 /distributed/launch.py ${COMMAND}
+    # command: /usr/sbin/sshd -D -p 2222
