@@ -322,9 +322,8 @@ class CustomExecutor(Executor):
     def execute_model(
         self,
         scheduler_output,
+        non_block: bool = False,
     ) -> Union[ModelRunnerOutput, concurrent.futures.Future[ModelRunnerOutput]]:
-        non_block = self.max_concurrent_batches > 1
-
         if not self.has_connector:
             # get output only from a single worker (output_rank)
             (output,) = self.collective_rpc(
