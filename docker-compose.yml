@@ -1,6 +1,5 @@
 services:
   vllm-distributed:
-    # image: nvcr.io/nvidia/tritonserver:25.06-vllm-python-py3
     image: vllm-fixed
     container_name: vllm-distributed
     build:
@@ -22,7 +21,11 @@ services:
 #      - /sys/class/infiniband:/sys/class/infiniband:ro
 #      - /dev/infiniband:/dev/infiniband
       - /dev/shm:/dev/shm
+      # used by VLLM for compiled model caching, pip cache, etc. Should be unique per container
       - ${ROOT_CACHE_PATH}:/root/.cache
+      # the path to where Hugging Face Hub cache is stored. Will use root cache path by default,
+      # but should be provided to share a common cache across different containers.
+      - ${HUGGINGFACE_HUB_CACHE:-${ROOT_CACHE_PATH}/huggingface}:/root/.cache/huggingface
       - ./src:/distributed
     security_opt:
       - seccomp:unconfined
