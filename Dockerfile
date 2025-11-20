@@ -1,9 +1,16 @@
-FROM vllm/vllm-openai:latest-x86_64
+FROM vllm/vllm-openai:nightly
 
-RUN pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu129
+# RUN pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu129
 
 # needed for nvfp4
-RUN pip3 install -U flashinfer-python==0.3.1.post1
+# RUN pip3 install -U flashinfer-python==0.5.2
+
+# needed by kimi k2 thinking for older builds
+# RUN pip3 install blobfile
+
+# RUN git clone https://github.com/vllm-project/vllm.git vllm-src && \
+#     cd vllm-src && \
+#     pip3 install -e .
 
 #RUN apt -y install openssh-server && mkdir -p /run/sshd && ssh-keygen -A
 # enable permit root login
