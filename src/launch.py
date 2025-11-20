@@ -39,12 +39,13 @@ from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils import (FlexibleArgumentParser, cuda_device_count_stateless,
-                        get_distributed_init_method, get_ip, get_open_port,
-                        run_method)
+from vllm.v1.serial_utils import run_method
+from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
+from vllm.utils.torch_utils import cuda_device_count_stateless
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.worker.worker_base import WorkerWrapperBase
+from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 import rpc
 import rpc_reader
@@ -428,8 +429,7 @@ async def run_server(args, client_config=None, **uvicorn_kwargs) -> None:
         maybe_register_tokenizer_info_endpoint(args)
         app = build_app(args)
 
-        vllm_config = await engine_client.get_vllm_config()
-        await init_app_state(engine_client, vllm_config, app.state, args)
+        await init_app_state(engine_client, app.state, args)
 
         logger.info("Starting vLLM API server %d on %s", server_index, listen_address)
         shutdown_task = await serve_http(
