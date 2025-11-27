@@ -4,6 +4,7 @@ import gc
 import importlib
 import multiprocessing
 import multiprocessing.connection
+from multiprocessing.synchronize import Lock as LockType
 import os
 import sys
 import threading
@@ -150,7 +151,8 @@ class CustomExecutor(Executor):
         async def spawn_and_listen_for_workers():
             loop = asyncio.get_event_loop()
             loop_ready.set_result(loop)
-
+            shared_worker_lock = multiprocessing.get_context("spawn").Lock()
+    
             async def get_run_worker(
                 rank: int,
                 local_rank: int,
@@ -163,6 +165,7 @@ class CustomExecutor(Executor):
                         "vllm_config": self.vllm_config,
                         "rank": rank,
                         "local_rank": local_rank,
+                        "shared_worker_lock": shared_worker_lock,
                     },
                     daemon=True,
                 )
@@ -508,15 +511,17 @@ def vllm_main():
 
 
 class WorkerWrapper(WorkerWrapperBase):
-    def __init__(self, vllm_config, rpc_rank: int, local_rank: int):
+    def __init__(self, vllm_config, rpc_rank: int, local_rank: int, shared_worker_lock: LockType):
         super().__init__(vllm_config, rpc_rank)
         self.local_rank = local_rank
+        self.shared_worker_lock = shared_worker_lock
         logger.info(f"WorkerWrapper created for rpc_rank {rpc_rank}, local_rank {local_rank}")
 
     def init_worker(self, all_kwargs):
         kwargs = all_kwargs[self.rpc_rank]
         # the main server doesn't know what the rank is and passes -1, so ckibber it here.
         kwargs["local_rank"] = self.local_rank
+        kwargs["shared_worker_lock"] = self.shared_worker_lock
         return super().init_worker(all_kwargs)
 
 
@@ -637,13 +642,14 @@ async def worker_async_main(
     vllm_config: VllmConfig,
     rank: int,
     local_rank: int,
+    shared_worker_lock: LockType,
 ):
     loop = asyncio.get_event_loop()
     peer, readLoop = await rpc_reader.prepare_peer_readloop(loop, rpc_transport)
     peer.params["print"] = print
     peer.params["local_rank"] = local_rank
 
-    wrapper = WorkerWrapper(vllm_config=vllm_config, rpc_rank=rank, local_rank=local_rank)
+    wrapper = WorkerWrapper(vllm_config=vllm_config, rpc_rank=rank, local_rank=local_rank, shared_worker_lock=shared_worker_lock)
     set_peer_run_worker(peer, wrapper, rank, local_rank)
 
     try:
