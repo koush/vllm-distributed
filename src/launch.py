@@ -4,8 +4,8 @@ import gc
 import importlib
 import multiprocessing
 import multiprocessing.connection
-from multiprocessing.synchronize import Lock as LockType
 import os
+import pickle
 import sys
 import threading
 import traceback
@@ -14,9 +14,12 @@ from argparse import Namespace
 from asyncio.events import AbstractEventLoop
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from multiprocessing.synchronize import Lock as LockType
 from typing import Any, AsyncIterator, List, Optional, Union
 
 import cloudpickle
+import rpc
+import rpc_reader
 import uvloop
 import vllm.engine.arg_utils
 import vllm.entrypoints.cli.benchmark.main
@@ -40,16 +43,14 @@ from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.v1.serial_utils import run_method
-from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
-from vllm.utils.torch_utils import cuda_device_count_stateless
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.utils.network_utils import (get_distributed_init_method, get_ip,
+                                      get_open_port)
+from vllm.utils.torch_utils import cuda_device_count_stateless
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.serial_utils import run_method
 from vllm.v1.worker.worker_base import WorkerWrapperBase
-
-import rpc
-import rpc_reader
 
 VLLM_SERVER_PORT = int(os.environ.get("VLLM_SERVER_PORT", 30044))
 
@@ -61,6 +62,8 @@ CreateWorkerType = Callable[[VllmConfig, int, dict[str, str]], Awaitable[RunWork
 
 class CustomExecutor(Executor):
     uses_ray: bool = False
+    supports_pp: bool = True
+
     # These env vars are worker-specific, therefore are NOT copied
     # from the driver to the workers
     WORKER_SPECIFIC_ENV_VARS = {
@@ -323,34 +326,31 @@ class CustomExecutor(Executor):
         else:
             self.failure_callback = callback
 
-    def execute_model(
-        self,
-        scheduler_output,
-        non_block: bool = False,
-    ) -> Union[ModelRunnerOutput, concurrent.futures.Future[ModelRunnerOutput]]:
-        if not self.has_connector:
-            # get output only from a single worker (output_rank)
-            (output,) = self.collective_rpc(
-                "execute_model",
-                args=(scheduler_output,),
-                unique_reply_rank=self.output_rank,
-                non_block=non_block,
-                timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
-            )
-            return output
-
-        # get output from all workers
-        outputs = self.collective_rpc(
+    def execute_model(  # type: ignore[override]
+        self, scheduler_output, non_block: bool = False
+    ):
+        (output,) = self.collective_rpc(
             "execute_model",
             args=(scheduler_output,),
+            unique_reply_rank=self.output_rank,
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+            kv_output_aggregator=self.kv_output_aggregator,
         )
+        return output
 
-        # aggregate all workers output to a single output
-        if non_block:
-            return self.kv_output_aggregator.async_aggregate(outputs, self.output_rank)
-        return self.kv_output_aggregator.aggregate(outputs, self.output_rank)
+    def sample_tokens(  # type: ignore[override]
+        self, grammar_output, non_block: bool = False
+    ):
+        (output,) = self.collective_rpc(
+            "sample_tokens",
+            args=(grammar_output,),
+            unique_reply_rank=self.output_rank,
+            non_block=non_block,
+            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+            kv_output_aggregator=self.kv_output_aggregator,
+        )
+        return output
 
     def collective_rpc(
         self,
@@ -360,6 +360,7 @@ class CustomExecutor(Executor):
         kwargs: Optional[dict] = None,
         non_block: bool = False,
         unique_reply_rank: Optional[int] = None,
+        kv_output_aggregator: KVOutputAggregator = None,
     ) -> list[Any]:
         if self.is_failed:
             raise RuntimeError("Executor failed.")
@@ -372,7 +373,7 @@ class CustomExecutor(Executor):
                 ret = await w(p)
                 return cloudpickle.loads(ret)
             future = asyncio.run_coroutine_threadsafe(
-                coro(run_worker, cloudpickle.dumps([method, unique_reply_rank, list(args), kwargs])),
+                coro(run_worker, cloudpickle.dumps([method, unique_reply_rank, list(args), kwargs], protocol=pickle.HIGHEST_PROTOCOL)),
                 loop=self.loop,
             )
             futures.append(future)
@@ -531,7 +532,7 @@ def set_peer_run_worker(peer: rpc.RpcPeer, wrapper: WorkerWrapper, rank: int, lo
         kwargs = kwargs or {}
         try:
             results = run_method(wrapper, method, args, kwargs)
-            results = cloudpickle.dumps(results)
+            results = cloudpickle.dumps(results, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception as e:
             logger.error("Error occurred while running method '%s': %s", method, e)
             f = traceback.format_exc()

@@ -33,17 +33,23 @@ services:
       - IPC_LOCK
     environment:
       - HUGGING_FACE_HUB_TOKEN
+
+      - VLLM_SLEEP_WHEN_IDLE=${VLLM_SLEEP_WHEN_IDLE:-1}
       - VLLM_HOST_IP=${VLLM_HOST_IP:-127.0.0.1}
       - VLLM_USE_MODELSCOPE
       - VLLM_SERVER_PORT
       - VLLM_PP_LAYER_PARTITION
       - VLLM_USE_DEEP_GEMM
       - VLLM_ATTENTION_BACKEND
-      - NCCL_SOCKET_IFNAME
+
+      - CUDA_DEVICE_ORDER
+
       - GLOO_SOCKET_IFNAME
+      - NCCL_SOCKET_IFNAME
       - NCCL_DEBUG=TRACE
     network_mode: host
     ipc: host
     entrypoint: []
     command: python3 /distributed/launch.py ${COMMAND}
+    # command: ${COMMAND}
     # command: /usr/sbin/sshd -D -p 2222
