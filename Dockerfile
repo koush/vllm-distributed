@@ -1,5 +1,8 @@
 FROM vllm/vllm-openai:nightly
 
+#RUN apt -y update && apt -y install git
+#RUN pip3 install git+https://github.com/deepseek-ai/DeepGEMM.git@v2.1.1.post3 --no-build-isolation # Other versions may also work. We recommend using the latest released version from https://github.com/deepseek-ai/DeepGEMM/releases
+
 # RUN pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu129
 
 # needed for nvfp4

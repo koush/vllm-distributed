@@ -32,7 +32,7 @@ from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.openai.api_server import (
     build_app, build_async_engine_client_from_engine_args, init_app_state,
-    load_log_config, maybe_register_tokenizer_info_endpoint, setup_server)
+    load_log_config, setup_server)
 # yapf conflicts with isort for this block
 # yapf: disable
 # yapf: enable
@@ -429,7 +429,6 @@ async def run_server(args, client_config=None, **uvicorn_kwargs) -> None:
         uvicorn_kwargs["log_config"] = log_config
 
     async with build_async_engine_client(args, client_config) as engine_client:
-        maybe_register_tokenizer_info_endpoint(args)
         app = build_app(args)
 
         await init_app_state(engine_client, app.state, args)
