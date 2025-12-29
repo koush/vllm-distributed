@@ -48,6 +48,7 @@ from vllm.utils.network_utils import (get_distributed_init_method, get_ip,
                                       get_open_port)
 from vllm.utils.torch_utils import cuda_device_count_stateless
 from vllm.v1.executor.abstract import Executor, FailureCallback
+from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.serial_utils import run_method
 from vllm.v1.worker.worker_base import WorkerWrapperBase
@@ -80,6 +81,8 @@ class CustomExecutor(Executor):
         super().__init__(*args, **kwargs)
 
     def _init_executor(self):
+        set_multiprocessing_worker_envs()
+
         # Call self.shutdown at exit to clean up
         # and ensure workers will be terminated.
         self._finalizer = weakref.finalize(self, self.shutdown)
